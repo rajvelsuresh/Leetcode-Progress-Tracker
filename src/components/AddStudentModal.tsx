@@ -32,8 +32,8 @@ export const AddStudentModal: React.FC<AddStudentModalProps> = ({
 
   // Handle Verify with LeetCode API
   const handleVerifyLeetcode = async () => {
-    const handle = leetcodeUsername.trim();
-    if (!handle) {
+    const cleanHandle = leetcodeUsername.trim().replace(/^@/, '');
+    if (!cleanHandle) {
       setVerifyStatus({ success: false, message: 'Please enter a LeetCode username first.' });
       return;
     }
@@ -42,19 +42,20 @@ export const AddStudentModal: React.FC<AddStudentModalProps> = ({
     setVerifyStatus(null);
 
     try {
-      const res = await fetch(`/api/leetcode/profile/${encodeURIComponent(handle)}`);
-      if (res.ok) {
-        const data = await res.json();
+      const res = await fetch(`/api/leetcode/profile/${encodeURIComponent(cleanHandle)}`);
+      const data = await res.json();
+      
+      if (res.ok && data && data.success) {
         setFetchedData(data);
         if (!name && data.realName) setName(data.realName);
         setVerifyStatus({
           success: true,
-          message: `Verified! Found profile with ${data.totalSolved} solved problems.`
+          message: `Verified! Found @${data.username} with ${data.totalSolved} solved problems (Rank #${data.ranking ? data.ranking.toLocaleString() : 'N/A'}).`
         });
       } else {
         setVerifyStatus({
           success: false,
-          message: `LeetCode handle "${handle}" not found or rate-limited. You can still save manually.`
+          message: data?.error || `LeetCode handle "${cleanHandle}" not found. You can still save manually.`
         });
       }
     } catch (err: any) {
@@ -74,6 +75,7 @@ export const AddStudentModal: React.FC<AddStudentModalProps> = ({
       return;
     }
 
+    const cleanHandle = leetcodeUsername.trim().replace(/^@/, '');
     const selectedClass = classes.find(c => c.id === classId || c._id === classId);
     const faculty = faculties.find(f => f.id === selectedClass?.facultyAdvisorId || f._id === selectedClass?.facultyAdvisorId);
 
@@ -93,8 +95,8 @@ export const AddStudentModal: React.FC<AddStudentModalProps> = ({
       section: selectedClass?.section,
       facultyAdvisorId: faculty ? (faculty.id || faculty._id) : undefined,
       facultyAdvisorName: faculty?.name,
-      leetcodeUsername: leetcodeUsername.trim(),
-      avatarUrl: fetchedData?.avatarUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${leetcodeUsername.trim()}`,
+      leetcodeUsername: cleanHandle,
+      avatarUrl: fetchedData?.avatarUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanHandle}`,
       totalSolved,
       easySolved,
       mediumSolved,
@@ -106,6 +108,7 @@ export const AddStudentModal: React.FC<AddStudentModalProps> = ({
       streakDays: Math.floor(Math.random() * 15) + 1,
       lastActive: Date.now(),
       badges: fetchedData?.badges || [],
+      recentSubmissions: fetchedData?.recentSubmissions || [],
       skillTags: ['Arrays', 'Strings', 'Binary Search'],
       weeklyGoal: 8,
       weeklySolved: 5,
@@ -175,9 +178,49 @@ export const AddStudentModal: React.FC<AddStudentModalProps> = ({
               <p className={`text-xs mt-1.5 flex items-center gap-1 font-medium ${
                 verifyStatus.success ? 'text-emerald-600' : 'text-amber-600'
               }`}>
-                {verifyStatus.success ? <CheckCircle className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
-                {verifyStatus.message}
+                {verifyStatus.success ? <CheckCircle className="w-3.5 h-3.5 shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 shrink-0" />}
+                <span>{verifyStatus.message}</span>
               </p>
+            )}
+
+            {fetchedData && (
+              <div className="mt-2.5 p-3 rounded-xl bg-slate-50 border border-slate-200/80 flex items-center justify-between">
+                <div className="flex items-center space-x-3">
+                  <img
+                    src={fetchedData.avatarUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${leetcodeUsername}`}
+                    alt="LeetCode Avatar"
+                    className="w-9 h-9 rounded-full bg-slate-200 border border-slate-300 object-cover"
+                  />
+                  <div>
+                    <div className="flex items-center space-x-1.5">
+                      <span className="text-xs font-bold text-slate-800">
+                        {fetchedData.realName || fetchedData.username}
+                      </span>
+                      <span className="text-[11px] font-mono text-amber-600">
+                        @{fetchedData.username}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-500">
+                      Rank #{fetchedData.ranking ? fetchedData.ranking.toLocaleString() : 'N/A'} • {fetchedData.attendedContests || 0} contests
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center space-x-1.5 text-[11px] font-semibold">
+                  <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    {fetchedData.easySolved}E
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                    {fetchedData.mediumSolved}M
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200">
+                    {fetchedData.hardSolved}H
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-slate-900 text-white font-bold">
+                    {fetchedData.totalSolved} Total
+                  </span>
+                </div>
+              </div>
             )}
           </div>
 

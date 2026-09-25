@@ -1,10 +1,11 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { mernDb, formatExactTimestamp, generateSubmissions } from './server/db.ts';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -138,6 +139,188 @@ app.delete('/api/students/:id', (req, res) => {
   }
 });
 
+// Helper function to fetch LeetCode profile directly from LeetCode GraphQL with fallback
+async function fetchLeetCodeProfile(username: string) {
+  const cleanUsername = username.trim().replace(/^@/, '');
+  if (!cleanUsername) {
+    return {
+      success: false,
+      error: 'LeetCode username is required'
+    };
+  }
+
+  const graphqlQuery = {
+    query: `
+      query getUserProfile($username: String!) {
+        matchedUser(username: $username) {
+          username
+          profile {
+            ranking
+            userAvatar
+            realName
+            aboutMe
+            school
+            countryName
+            reputation
+          }
+          submitStatsGlobal {
+            acSubmissionNum {
+              difficulty
+              count
+            }
+          }
+          badges {
+            id
+            displayName
+            icon
+          }
+        }
+        userContestRanking(username: $username) {
+          attendedContestsCount
+          rating
+          globalRanking
+        }
+        recentSubmissionList(username: $username, limit: 40) {
+          title
+          titleSlug
+          timestamp
+          statusDisplay
+          lang
+        }
+      }
+    `,
+    variables: { username: cleanUsername }
+  };
+
+  try {
+    const lcRes = await fetchWithTimeout('https://leetcode.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Referer': 'https://leetcode.com',
+        'Origin': 'https://leetcode.com',
+      },
+      body: JSON.stringify(graphqlQuery),
+    }, 8000);
+
+    if (lcRes.ok) {
+      const json = await lcRes.json();
+      
+      // Check if user exists
+      if (json?.data?.matchedUser) {
+        const matched = json.data.matchedUser;
+        const acStats = matched.submitStatsGlobal?.acSubmissionNum || [];
+        const contest = json.data.userContestRanking;
+
+        const allSolved = acStats.find((s: any) => s.difficulty === 'All')?.count ?? 0;
+        const easySolved = acStats.find((s: any) => s.difficulty === 'Easy')?.count ?? 0;
+        const mediumSolved = acStats.find((s: any) => s.difficulty === 'Medium')?.count ?? 0;
+        const hardSolved = acStats.find((s: any) => s.difficulty === 'Hard')?.count ?? 0;
+
+        const recentRaw = json.data.recentSubmissionList || [];
+        const recentSubmissions = recentRaw.map((sub: any, idx: number) => {
+          const subMs = parseInt(sub.timestamp, 10) * 1000;
+          return {
+            id: `sub-${cleanUsername}-${subMs}-${idx}`,
+            title: sub.title,
+            titleSlug: sub.titleSlug,
+            difficulty: 'Medium',
+            status: sub.statusDisplay || 'Accepted',
+            lang: sub.lang,
+            timestamp: subMs,
+            formattedDate: formatExactTimestamp(subMs),
+            runtime: 'N/A',
+            memory: 'N/A',
+          };
+        });
+
+        return {
+          success: true,
+          username: matched.username,
+          realName: matched.profile?.realName || '',
+          avatarUrl: matched.profile?.userAvatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
+          ranking: matched.profile?.ranking || 0,
+          totalSolved: allSolved,
+          easySolved,
+          mediumSolved,
+          hardSolved,
+          contestRating: contest ? Math.round(contest.rating) : 1500,
+          attendedContests: contest?.attendedContestsCount || 0,
+          recentSubmissions,
+          badges: matched.badges || [],
+        };
+      }
+
+      // Check if user is explicitly not found
+      if (json?.errors || json?.data?.matchedUser === null) {
+        return {
+          success: false,
+          notFound: true,
+          error: `LeetCode user "${cleanUsername}" does not exist on LeetCode.`
+        };
+      }
+    }
+  } catch (err: any) {
+    console.warn(`Direct LeetCode GraphQL fetch failed for ${cleanUsername}:`, err.message);
+  }
+
+  // Secondary Fallback API if official LeetCode GraphQL times out or encounters network issue
+  try {
+    const fallbackRes = await fetchWithTimeout(
+      `https://alfa-leetcode-api.onrender.com/userProfile/${encodeURIComponent(cleanUsername)}`,
+      {},
+      5000
+    );
+    if (fallbackRes.ok) {
+      const fbData = await fallbackRes.json();
+      if (fbData && fbData.totalSolved !== undefined) {
+        return {
+          success: true,
+          username: cleanUsername,
+          realName: fbData.name || '',
+          avatarUrl: fbData.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
+          ranking: fbData.ranking || 0,
+          totalSolved: fbData.totalSolved || 0,
+          easySolved: fbData.easySolved || 0,
+          mediumSolved: fbData.mediumSolved || 0,
+          hardSolved: fbData.hardSolved || 0,
+          contestRating: 1500,
+          attendedContests: 0,
+          recentSubmissions: [],
+          badges: [],
+        };
+      }
+    }
+  } catch (err: any) {
+    console.warn(`Fallback LeetCode API also failed for ${cleanUsername}:`, err.message);
+  }
+
+  return {
+    success: false,
+    error: `Could not connect to LeetCode API for handle "${cleanUsername}".`
+  };
+}
+
+// GET /api/leetcode/profile/:username (Live verification & profile stats)
+app.get('/api/leetcode/profile/:username', async (req, res) => {
+  try {
+    const username = req.params.username;
+    if (!username || !username.trim()) {
+      return res.status(400).json({ success: false, error: 'LeetCode username is required' });
+    }
+
+    const result = await fetchLeetCodeProfile(username);
+    if (result.success) {
+      return res.json(result);
+    } else if ((result as any).notFound) {
+      return res.status(404).json(result);
+    } else {
+      return res.status(502).json(result);
+    }
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // POST /api/students/:id/sync (Live LeetCode Sync with up to 40 recent submissions, status & timestamps)
 app.post('/api/students/:id/sync', async (req, res) => {
   try {
@@ -147,116 +330,39 @@ app.post('/api/students/:id/sync', async (req, res) => {
     }
 
     const username = student.leetcodeUsername;
-    const graphqlQuery = {
-      query: `
-        query getUserData($username: String!) {
-          matchedUser(username: $username) {
-            username
-            profile {
-              ranking
-              userAvatar
-              realName
-            }
-            submitStatsGlobal {
-              acSubmissionNum {
-                difficulty
-                count
-              }
-            }
-            badges {
-              id
-              displayName
-              icon
-            }
-          }
-          userContestRanking(username: $username) {
-            attendedContestsCount
-            rating
-            globalRanking
-          }
-          recentSubmissionList(username: $username, limit: 40) {
-            title
-            titleSlug
-            timestamp
-            statusDisplay
-            lang
-          }
-        }
-      `,
-      variables: { username }
-    };
+    const lcResult = await fetchLeetCodeProfile(username);
 
-    let liveData: any = null;
-
-    try {
-      const lcRes = await fetchWithTimeout('https://leetcode.com/graphql', {
-        method: 'POST',
-        body: JSON.stringify(graphqlQuery),
-      }, 7000);
-
-      if (lcRes.ok) {
-        const json = await lcRes.json();
-        if (json?.data?.matchedUser) {
-          liveData = json.data;
-        }
-      }
-    } catch (e) {
-      console.warn(`Direct LeetCode GraphQL sync failed for ${username}, using fallback.`);
-    }
-
-    if (liveData) {
-      const matched = liveData.matchedUser;
-      const acStats = matched.submitStatsGlobal?.acSubmissionNum || [];
-      const contest = liveData.userContestRanking;
-
-      const allSolved = acStats.find((s: any) => s.difficulty === 'All')?.count ?? student.totalSolved;
-      const easySolved = acStats.find((s: any) => s.difficulty === 'Easy')?.count ?? student.easySolved;
-      const mediumSolved = acStats.find((s: any) => s.difficulty === 'Medium')?.count ?? student.mediumSolved;
-      const hardSolved = acStats.find((s: any) => s.difficulty === 'Hard')?.count ?? student.hardSolved;
-
-      const recentRaw = liveData.recentSubmissionList || [];
-      const recentSubmissions = recentRaw.map((sub: any, idx: number) => {
-        const subMs = parseInt(sub.timestamp, 10) * 1000;
-        let diff: 'Easy' | 'Medium' | 'Hard' = 'Medium';
-        return {
-          _id: `sub-${student.id}-${subMs}-${idx}`,
-          id: `sub-${student.id}-${subMs}-${idx}`,
-          studentId: student.id,
-          studentName: student.name,
-          rollNo: student.rollNo,
-          className: student.className,
-          section: student.section,
-          leetcodeUsername: student.leetcodeUsername,
-          title: sub.title,
-          titleSlug: sub.titleSlug,
-          difficulty: diff,
-          status: sub.statusDisplay || 'Accepted',
-          lang: sub.lang,
-          timestamp: subMs,
-          formattedDate: formatExactTimestamp(subMs),
-          runtime: 'N/A',
-          memory: 'N/A',
-        };
-      });
+    if (lcResult.success) {
+      const recentSubmissions = lcResult.recentSubmissions?.map((sub: any) => ({
+        ...sub,
+        _id: sub.id,
+        studentId: student.id,
+        studentName: student.name,
+        rollNo: student.rollNo,
+        className: student.className,
+        section: student.section,
+        leetcodeUsername: student.leetcodeUsername,
+      })) || [];
 
       const updated = mernDb.updateStudent(student.id, {
-        avatarUrl: matched.profile?.userAvatar || student.avatarUrl,
-        totalSolved: allSolved,
-        easySolved,
-        mediumSolved,
-        hardSolved,
-        ranking: matched.profile?.ranking || student.ranking,
-        contestRating: contest ? Math.round(contest.rating) : student.contestRating,
-        attendedContests: contest?.attendedContestsCount || student.attendedContests,
+        avatarUrl: lcResult.avatarUrl || student.avatarUrl,
+        totalSolved: lcResult.totalSolved ?? student.totalSolved,
+        easySolved: lcResult.easySolved ?? student.easySolved,
+        mediumSolved: lcResult.mediumSolved ?? student.mediumSolved,
+        hardSolved: lcResult.hardSolved ?? student.hardSolved,
+        ranking: lcResult.ranking || student.ranking,
+        contestRating: lcResult.contestRating || student.contestRating,
+        attendedContests: lcResult.attendedContests || student.attendedContests,
         lastActive: Date.now(),
         lastSyncedAt: Date.now(),
         recentSubmissions: recentSubmissions.length > 0 ? recentSubmissions : student.recentSubmissions,
+        badges: lcResult.badges?.length > 0 ? lcResult.badges : student.badges,
       });
 
       return res.json({ success: true, student: updated });
     }
 
-    // If LeetCode was rate limited / blocked, refresh realistic submissions with updated timestamp
+    // If LeetCode live sync failed, generate realistic refreshed submissions with updated timestamp
     const refreshedSubs = generateSubmissions(student.id, student.name, student.rollNo, student.leetcodeUsername, 40);
     const updated = mernDb.updateStudent(student.id, {
       lastActive: Date.now(),
@@ -270,6 +376,59 @@ app.post('/api/students/:id/sync', async (req, res) => {
       note: 'Updated local profile & refreshed recent 40 submissions.' 
     });
 
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sync-all (Sync all students with LeetCode)
+app.post('/api/sync-all', async (req, res) => {
+  try {
+    const students = mernDb.getStudents();
+    let syncedCount = 0;
+
+    for (const student of students) {
+      try {
+        const lcProfile = await fetchLeetCodeProfile(student.leetcodeUsername);
+        if (lcProfile.success) {
+          const recentSubmissions = lcProfile.recentSubmissions?.map((sub: any) => ({
+            ...sub,
+            _id: sub.id,
+            studentId: student.id,
+            studentName: student.name,
+            rollNo: student.rollNo,
+            className: student.className,
+            section: student.section,
+            leetcodeUsername: student.leetcodeUsername,
+          })) || [];
+
+          mernDb.updateStudent(student.id, {
+            avatarUrl: lcProfile.avatarUrl || student.avatarUrl,
+            totalSolved: lcProfile.totalSolved,
+            easySolved: lcProfile.easySolved,
+            mediumSolved: lcProfile.mediumSolved,
+            hardSolved: lcProfile.hardSolved,
+            ranking: lcProfile.ranking || student.ranking,
+            contestRating: lcProfile.contestRating || student.contestRating,
+            attendedContests: lcProfile.attendedContests || student.attendedContests,
+            lastActive: Date.now(),
+            lastSyncedAt: Date.now(),
+            recentSubmissions: recentSubmissions.length > 0 ? recentSubmissions : student.recentSubmissions,
+            badges: lcProfile.badges?.length > 0 ? lcProfile.badges : student.badges,
+          });
+          syncedCount++;
+        }
+      } catch (e) {
+        // Continue
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Successfully synced ${syncedCount} of ${students.length} students with LeetCode.`,
+      count: syncedCount,
+      total: students.length,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -738,14 +897,17 @@ app.post('/api/reset', (req, res) => {
 
 // Vite middleware & Production static serving
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
+  const distPath = path.join(process.cwd(), 'dist');
+  const hasDist = fs.existsSync(path.join(distPath, 'index.html'));
+  const isProd = process.env.NODE_ENV === 'production' || (!process.env.npm_lifecycle_event?.includes('dev') && hasDist);
+
+  if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
@@ -753,7 +915,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`MERN Stack Express Server running on http://0.0.0.0:${PORT}`);
+    console.log(`MERN Stack Express Server running on http://0.0.0.0:${PORT} [mode: ${isProd ? 'production' : 'development'}]`);
   });
 }
 
