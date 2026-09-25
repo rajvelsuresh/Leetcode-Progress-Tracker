@@ -1,0 +1,6 @@
+{
+  "name": "LeetCode Student Progress Tracker",
+  "description": "Role-based LeetCode student progress tracker with separate Admin and Faculty portals, class management, class member editing, faculty password reset, faculty-class assigning, and recent 40 submissions tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
